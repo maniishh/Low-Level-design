@@ -153,35 +153,211 @@ Its responsibilities are to:
 **Key idea:** Callers interact with `RateLimiter`, not with individual algorithm implementations.
 
 ---
+# 🚦 Rate Limiter — Low-Level Design in C++
 
-## 🔄 5. Request Lifecycle
+<p align="center">
+  <strong>A concurrent, policy-driven rate limiter using the Strategy Pattern</strong>
+</p>
+
+<p align="center">
+  ![Language](https://img.shields.io/badge/Language-C%2B%2B17-blue?style=flat-square)
+  ![Design Pattern](https://img.shields.io/badge/Pattern-Strategy-purple?style=flat-square)
+  ![Focus](https://img.shields.io/badge/Focus-Concurrency-orange?style=flat-square)
+</p>
+
+## 1. Problem Statement
+
+A rate limiter controls how many requests a client can make to a service within a specified time window. It protects APIs from excessive traffic and helps preserve server capacity for other clients.
+
+**Example policies:**
+
+| Client / Endpoint | Limit | Time Window |
+|---|---:|---|
+| Free user | 10 requests | 1 minute |
+| Premium user | 100 requests | 1 minute |
+| Login endpoint | 5 requests | 1 minute |
+
+The goal is to implement a reusable rate limiter with configurable policies, concurrency safety, and interchangeable algorithms.
+
+## 2. Requirements
+
+- **Configurable client identification:** Identify clients using a user ID or IP address.
+- **Policy-based limits:** Apply different limits based on subscription tier and endpoint.
+- **Useful results:** Return an allow/reject decision and `retryAfter` metadata.
+- **Concurrency safety:** Prevent concurrent requests from exceeding the limit in a single process.
+- **Extensibility:** Support different rate-limiting algorithms through a common interface.
+
+## 3. Architecture Overview
+
+```mermaid
+flowchart TD
+    A["Incoming Request"] --> B["RateLimiter"]
+    B --> C["Resolve Client Key"]
+    B --> D["PolicyResolver"]
+    C --> E["Algorithm"]
+    D --> E
+    E --> F{"Allowed?"}
+    F -->|Yes| G["Continue to API"]
+    F -->|No| H["HTTP 429 Too Many Requests"]
+    H --> I["Retry-After"]
+```
+
+The `RateLimiter` coordinates the process. `PolicyResolver` chooses the applicable policy, while the algorithm enforces it.
+
+## 4. UML Class Diagram
+
+```mermaid
+classDiagram
+    class RequestContext {
+        +string userId
+        +string ipAddress
+        +string endpoint
+        +Tier tier
+    }
+
+    class Tier {
+        <<enumeration>>
+        FREE
+        PREMIUM
+    }
+
+    class Policy {
+        +int limit
+        +seconds windowDuration
+    }
+
+    class RateLimitResult {
+        +bool allowed
+        +seconds retryAfter
+    }
+
+    class PolicyResolver {
+        +resolve(request) Policy
+    }
+
+    class RateLimiter {
+        -PolicyResolver policyResolver
+        -RateLimitAlgorithm algorithm
+        -resolveKey(request) string
+        +checkRequest(request) RateLimitResult
+    }
+
+    class RateLimitAlgorithm {
+        <<interface>>
+        +allow(key, policy) RateLimitResult
+    }
+
+    class FixedWindowAlgorithm {
+        -windows
+        -mutex mtx
+        +allow(key, policy) RateLimitResult
+    }
+
+    class SlidingWindowAlgorithm {
+        +allow(key, policy) RateLimitResult
+    }
+
+    class TokenBucketAlgorithm {
+        +allow(key, policy) RateLimitResult
+    }
+
+    RequestContext --> Tier
+    PolicyResolver ..> RequestContext : reads
+    PolicyResolver ..> Policy : creates
+    RateLimiter --> PolicyResolver : uses
+    RateLimiter --> RateLimitAlgorithm : delegates to
+    RateLimiter ..> RequestContext : accepts
+    RateLimiter ..> RateLimitResult : returns
+    RateLimitAlgorithm <|.. FixedWindowAlgorithm
+    RateLimitAlgorithm <|.. SlidingWindowAlgorithm
+    RateLimitAlgorithm <|.. TokenBucketAlgorithm
+```
+
+*Note: `SlidingWindowAlgorithm` and `TokenBucketAlgorithm` are future extension points in this implementation, not implemented classes in the current C++ file.*
+
+## 5. Request Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant C as Client
-    participant M as Middleware
-    participant R as RateLimiter
-    participant P as Policy Resolver
-    participant A as Algorithm
+    actor Client
+    participant RL as RateLimiter
+    participant PR as PolicyResolver
+    participant ALG as RateLimitAlgorithm
     participant API as Backend API
 
-    C->>M: Send HTTP request
-    M->>R: Check request
-    R->>R: Resolve client key
-    R->>P: Resolve policy
-    P-->>R: Return applicable policy
-    R->>A: allow(key, policy)
-    A-->>R: RateLimitResult
-    R-->>M: Return decision
+    Client->>RL: checkRequest(context)
+    RL->>RL: Resolve client key
+    RL->>PR: resolve(context)
+    PR-->>RL: Policy
+    RL->>ALG: allow(key, policy)
+    ALG->>ALG: Atomically check and update state
+    ALG-->>RL: RateLimitResult
 
     alt Request allowed
-        M->>API: Forward request
-        API-->>C: API response
-    else Request rejected
-        M-->>C: 429 Too Many Requests
+        RL-->>Client: allowed = true
+        Client->>API: Continue request
+        API-->>Client: API response
+    else Limit exceeded
+        RL-->>Client: allowed = false, retryAfter
+        RL-->>Client: HTTP 429
     end
 ```
 
+## 6. Design Patterns Used
+
+### Strategy Pattern
+
+`RateLimitAlgorithm` defines a common contract. Different algorithms can implement that contract without changing `RateLimiter`.
+
+### Separation of Responsibilities
+
+- `RateLimiter`: coordinates request processing.
+- `PolicyResolver`: selects the applicable limit.
+- `RateLimitAlgorithm`: makes the rate-limit decision.
+- `RateLimitResult`: communicates the outcome.
+
+## 7. Fixed Window Algorithm
+
+Each client key maintains a request counter and the start time of its current window.
+
+1. Initialize or reset the window when necessary.
+2. Reject the request if the counter has reached the limit.
+3. Otherwise, increment the counter and allow the request.
+4. On rejection, calculate the remaining window duration.
+
+**Time complexity:** Expected \(O(1)\) per request with a hash map.
+
+**Space complexity:** \(O(K)\), where \(K\) is the number of distinct keys retained in the map.
+
+## 8. Concurrency and Scalability
+
+The implementation uses a mutex to protect the counter check and update as one critical section. This prevents two threads from simultaneously consuming the same remaining request allowance.
+
+**Important limitation:** This is a single-process implementation. Multiple server instances would maintain independent counters. A distributed deployment would require shared state, such as Redis, with atomic operations or a Lua script.
+
+A production implementation should also consider idle-key expiration, memory cleanup, policy changes, and trusted client identification.
+
+## 9. Future Improvements
+
+- Implement Sliding Window and Token Bucket.
+- Add Redis-backed distributed rate limiting.
+- Add per-user and per-endpoint policy configuration.
+- Add unit tests for concurrency, window resets, and rejection behavior.
+- Expose standard rate-limit response headers.
+
+## 10. Run the Project
+
+```bash
+g++ -std=c++17 -pthread rate_limiter.cpp -o rate_limiter
+./rate_limiter
+```
+
+---
+
+**Key takeaway:** The design separates *which policy applies* from *how the limit is enforced*, making the system easier to test, extend, and evolve.
+
+
+ 
 This sequence keeps HTTP-specific behavior in the middleware and rate-counting behavior inside the algorithm.
 
 ---
